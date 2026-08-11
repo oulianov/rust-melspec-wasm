@@ -1,7 +1,222 @@
-use num::complex::Complex;
+use realfft::{RealFftPlanner, RealToComplex};
+#[cfg(test)]
+use rustfft::num_complex::Complex;
+use rustfft::num_complex::Complex32;
+use std::cell::RefCell;
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AnalyzerKey {
+    sample_rate: u32,
+    n_fft: usize,
+    win_length: usize,
+    f_min: u32,
+    f_max: u32,
+    n_mels: usize,
+}
+
+impl AnalyzerKey {
+    fn new(
+        sample_rate: f32,
+        n_fft: usize,
+        win_length: usize,
+        f_min: f32,
+        f_max: f32,
+        n_mels: usize,
+    ) -> Self {
+        Self {
+            sample_rate: sample_rate.to_bits(),
+            n_fft,
+            win_length,
+            f_min: f_min.to_bits(),
+            f_max: f_max.to_bits(),
+            n_mels,
+        }
+    }
+}
+
+thread_local! {
+    static ANALYZER_CACHE: RefCell<Vec<(AnalyzerKey, MelSpectrogramAnalyzer)>> =
+        RefCell::new(Vec::with_capacity(2));
+}
+
 #[wasm_bindgen]
+pub struct MelSpectrogramAnalyzer {
+    win_length: usize,
+    window: Vec<f32>,
+    mel_offsets: Vec<usize>,
+    mel_indices: Vec<usize>,
+    mel_weights: Vec<f32>,
+    n_mels: usize,
+    fft: Arc<dyn RealToComplex<f32>>,
+    fft_input: Vec<f32>,
+    fft_output: Vec<Complex32>,
+    fft_scratch: Vec<Complex32>,
+    mel_frame: Vec<f32>,
+}
+
+#[wasm_bindgen]
+impl MelSpectrogramAnalyzer {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        sample_rate: f32,
+        n_fft: usize,
+        win_length: usize,
+        f_min: f32,
+        f_max: f32,
+        n_mels: usize,
+    ) -> Self {
+        assert!(n_fft.is_power_of_two(), "n_fft must be a power of 2");
+        assert!(n_fft >= win_length);
+        assert!(win_length > 1);
+        assert!(n_mels > 0);
+
+        let n_freqs = n_fft / 2 + 1;
+        let f_nyquist = sample_rate / 2.0;
+        let m_min = hz_to_mel(f_min);
+        let m_max = hz_to_mel(f_max);
+        let f_points: Vec<f32> = (0..n_mels + 2)
+            .map(|i| mel_to_hz(m_min + (m_max - m_min) * i as f32 / (n_mels + 1) as f32))
+            .collect();
+        let f_diff: Vec<f32> = f_points
+            .windows(2)
+            .map(|points| points[1] - points[0])
+            .collect();
+        let mut mel_offsets = Vec::with_capacity(n_freqs + 1);
+        let mut mel_indices = Vec::with_capacity(n_freqs * 2);
+        let mut mel_weights = Vec::with_capacity(n_freqs * 2);
+        for frequency_index in 0..n_freqs {
+            mel_offsets.push(mel_indices.len());
+            let frequency = f_nyquist * frequency_index as f32 / (n_freqs - 1) as f32;
+            for mel_index in 0..n_mels {
+                let down_slope = (frequency - f_points[mel_index]) / f_diff[mel_index];
+                let up_slope = (f_points[mel_index + 2] - frequency) / f_diff[mel_index + 1];
+                let weight = down_slope.min(up_slope).max(0.0)
+                    * (2.0 / (f_points[mel_index + 2] - f_points[mel_index]));
+                if weight > 0.0 {
+                    mel_indices.push(mel_index);
+                    mel_weights.push(weight);
+                }
+            }
+        }
+        mel_offsets.push(mel_indices.len());
+
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(n_fft);
+        let fft_input = fft.make_input_vec();
+        let fft_output = fft.make_output_vec();
+        let fft_scratch = fft.make_scratch_vec();
+
+        Self {
+            win_length,
+            window: hann_window(win_length),
+            mel_offsets,
+            mel_indices,
+            mel_weights,
+            n_mels,
+            fft,
+            fft_input,
+            fft_output,
+            fft_scratch,
+            mel_frame: vec![0.0; n_mels],
+        }
+    }
+
+    pub fn compute_db(&mut self, waveform: &[f32], hop_length: usize, top_db: f32) -> Vec<f32> {
+        assert!(self.win_length >= hop_length);
+        assert!(hop_length > 0);
+
+        let pad_size = (self.win_length - hop_length) / 2;
+        let padded_length = waveform.len() + pad_size * 2;
+        let frame_end = padded_length
+            .checked_sub(self.win_length + pad_size)
+            .expect("waveform is too short for the configured window and hop lengths");
+        let frame_count = frame_end.div_ceil(hop_length);
+        let mut result = Vec::with_capacity(frame_count * self.n_mels);
+
+        for frame_start in (0..frame_end).step_by(hop_length) {
+            self.fft_input.fill(0.0);
+            for window_index in 0..self.win_length {
+                let padded_index = frame_start + window_index;
+                if padded_index >= pad_size && padded_index < pad_size + waveform.len() {
+                    self.fft_input[window_index] =
+                        waveform[padded_index - pad_size] * self.window[window_index];
+                }
+            }
+            self.fft
+                .process_with_scratch(
+                    &mut self.fft_input,
+                    &mut self.fft_output,
+                    &mut self.fft_scratch,
+                )
+                .expect("reusable real FFT buffers have inconsistent lengths");
+
+            self.mel_frame.fill(0.0);
+            for (frequency_index, value) in self.fft_output.iter().enumerate() {
+                let magnitude = value.norm();
+                for contribution_index in
+                    self.mel_offsets[frequency_index]..self.mel_offsets[frequency_index + 1]
+                {
+                    self.mel_frame[self.mel_indices[contribution_index]] +=
+                        magnitude * self.mel_weights[contribution_index];
+                }
+            }
+            result.extend_from_slice(&self.mel_frame);
+        }
+
+        let mut max_db = f32::NEG_INFINITY;
+        for value in result.iter_mut() {
+            *value = 20.0 * value.max(1e-10).log10();
+            max_db = max_db.max(*value);
+        }
+        for value in result.iter_mut() {
+            *value = value.max(max_db - top_db);
+        }
+        result
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_cached(
+    sample_rate: f32,
+    waveform: &[f32],
+    n_fft: usize,
+    win_length: usize,
+    hop_length: usize,
+    f_min: f32,
+    f_max: f32,
+    n_mels: usize,
+    top_db: f32,
+) -> Vec<f32> {
+    let key = AnalyzerKey::new(sample_rate, n_fft, win_length, f_min, f_max, n_mels);
+    ANALYZER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let analyzer_index = cache.iter().position(|(cached_key, _)| *cached_key == key);
+        if let Some(analyzer_index) = analyzer_index {
+            if analyzer_index + 1 < cache.len() {
+                let analyzer = cache.remove(analyzer_index);
+                cache.push(analyzer);
+            }
+        } else {
+            if cache.len() == 2 {
+                cache.remove(0);
+            }
+            cache.push((
+                key,
+                MelSpectrogramAnalyzer::new(sample_rate, n_fft, win_length, f_min, f_max, n_mels),
+            ));
+        }
+        cache
+            .last_mut()
+            .expect("spectrogram analyzer cache must contain the requested configuration")
+            .1
+            .compute_db(waveform, hop_length, top_db)
+    })
+}
+
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
 pub fn mel_spectrogram_db(
     sample_rate: f32,
     waveform: Vec<f32>,
@@ -13,20 +228,23 @@ pub fn mel_spectrogram_db(
     n_mels: usize,
     top_db: f32,
 ) -> JsValue {
-    let mel_spec: Vec<Vec<f32>> = mel_spectrogram(
+    let flat = compute_cached(
         sample_rate,
-        waveform,
+        &waveform,
         n_fft,
         win_length,
         hop_length,
         f_min,
         f_max,
         n_mels,
+        top_db,
     );
-    let result: Vec<Vec<f32>> = amplitude_to_db(mel_spec, top_db);
-    serde_wasm_bindgen::to_value(&result).unwrap()
+    let rows: Vec<&[f32]> = flat.chunks_exact(n_mels).collect();
+    serde_wasm_bindgen::to_value(&rows).unwrap()
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn mel_spectrogram(
     sample_rate: f32,
     waveform: Vec<f32>,
@@ -59,6 +277,7 @@ fn mel_spectrogram(
     mel_spec
 }
 
+#[cfg(test)]
 fn spectrogram(
     waveform: Vec<f32>,
     n_fft: usize,
@@ -100,6 +319,7 @@ fn spectrogram(
     }
 }
 
+#[cfg(test)]
 fn fft(input: Vec<f32>, n_fft: usize) -> Vec<Complex<f32>> {
     let num_samples = input.len();
     assert!(n_fft.is_power_of_two(), "n_fft must be a power of 2");
@@ -144,6 +364,7 @@ fn hann_window(length: usize) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(test)]
 fn mel_filter_bank(
     n_freqs: usize,
     f_min: f32,
@@ -235,6 +456,7 @@ fn mel_to_hz(mel: f32) -> f32 {
     700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
 }
 
+#[cfg(test)]
 fn amplitude_to_db(amplitudes: Vec<Vec<f32>>, top_db: f32) -> Vec<Vec<f32>> {
     let dbs: Vec<Vec<f32>> = amplitudes
         .iter()
@@ -255,6 +477,7 @@ fn amplitude_to_db(amplitudes: Vec<Vec<f32>>, top_db: f32) -> Vec<Vec<f32>> {
         .collect()
 }
 
+#[cfg(test)]
 fn _assert_complex_eq(left: Complex<f32>, right: Complex<f32>) {
     // tolerance for floating-point comparison
     const EPSILON: f32 = 1e-5;
@@ -274,9 +497,79 @@ fn _assert_complex_eq(left: Complex<f32>, right: Complex<f32>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::excessive_precision)]
 mod tests {
     use super::*;
-    use num::complex::Complex;
+    use rustfft::num_complex::Complex;
+
+    fn test_waveform(length: usize, sample_rate: f32) -> Vec<f32> {
+        (0..length)
+            .map(|sample| {
+                let time = sample as f32 / sample_rate;
+                0.43 * (2.0 * std::f32::consts::PI * 440.0 * time).sin()
+                    + 0.24 * (2.0 * std::f32::consts::PI * 7_123.0 * time).sin()
+                    + 0.12 * (2.0 * std::f32::consts::PI * 21_337.0 * time).sin()
+            })
+            .collect()
+    }
+
+    fn assert_optimized_matches_legacy(
+        n_fft: usize,
+        hop_length: usize,
+        n_mels: usize,
+        waveform: Vec<f32>,
+    ) {
+        let sample_rate = 48_000.0;
+        let legacy: Vec<f32> = amplitude_to_db(
+            mel_spectrogram(
+                sample_rate,
+                waveform.clone(),
+                n_fft,
+                n_fft,
+                hop_length,
+                20.0,
+                24_000.0,
+                n_mels,
+            ),
+            90.0,
+        )
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut analyzer =
+            MelSpectrogramAnalyzer::new(sample_rate, n_fft, n_fft, 20.0, 24_000.0, n_mels);
+        let optimized = analyzer.compute_db(&waveform, hop_length, 90.0);
+        let cached = compute_cached(
+            sample_rate,
+            &waveform,
+            n_fft,
+            n_fft,
+            hop_length,
+            20.0,
+            24_000.0,
+            n_mels,
+            90.0,
+        );
+
+        assert_eq!(optimized.len(), legacy.len());
+        assert_eq!(cached, optimized);
+        let mut maximum_difference = 0.0_f32;
+        let mut difference_sum = 0.0_f64;
+        for (optimized_value, legacy_value) in optimized.iter().zip(legacy.iter()) {
+            let difference = (optimized_value - legacy_value).abs();
+            maximum_difference = maximum_difference.max(difference);
+            difference_sum += difference as f64;
+        }
+        let mean_difference = difference_sum / legacy.len() as f64;
+        assert!(
+            maximum_difference <= 0.02,
+            "maximum dB difference was {maximum_difference}; mean was {mean_difference}"
+        );
+        assert!(
+            mean_difference <= 0.001,
+            "mean dB difference was {mean_difference}; maximum was {maximum_difference}"
+        );
+    }
 
     #[test]
     fn test_fft_constant() {
@@ -310,5 +603,56 @@ mod tests {
         _assert_complex_eq(output[5], Complex::new(2.41421356, 1.24264069));
         _assert_complex_eq(output[6], Complex::new(-2.0, -2.0));
         _assert_complex_eq(output[7], Complex::new(-0.41421356, 7.24264069));
+    }
+
+    #[test]
+    fn optimized_analyzer_matches_legacy_at_2048() {
+        for hop_length in [64, 512, 2048] {
+            assert_optimized_matches_legacy(
+                2048,
+                hop_length,
+                256,
+                test_waveform(2048 * 4, 48_000.0),
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_analyzer_matches_legacy_at_4096() {
+        for hop_length in [128, 1024, 4096] {
+            assert_optimized_matches_legacy(
+                4096,
+                hop_length,
+                512,
+                test_waveform(4096 * 3, 48_000.0),
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_analyzer_reuses_its_plan_across_overview_batches() {
+        let waveform = test_waveform(2048 * 33, 48_000.0);
+        let mut analyzer = MelSpectrogramAnalyzer::new(48_000.0, 2048, 2048, 20.0, 24_000.0, 256);
+        let first = analyzer.compute_db(&waveform, 2048, 90.0);
+        let second = analyzer.compute_db(&waveform, 2048, 90.0);
+        assert_eq!(first.len(), 32 * 256);
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn legacy_api_cache_is_bounded_to_two_lod_configurations() {
+        ANALYZER_CACHE.with(|cache| cache.borrow_mut().clear());
+        let waveform = test_waveform(4096 * 3, 48_000.0);
+        for (n_fft, n_mels) in [(1024, 128), (2048, 256), (4096, 512)] {
+            compute_cached(
+                48_000.0, &waveform, n_fft, n_fft, n_fft, 20.0, 24_000.0, n_mels, 90.0,
+            );
+        }
+        ANALYZER_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), 2);
+            assert_eq!(cache[0].0.n_fft, 2048);
+            assert_eq!(cache[1].0.n_fft, 4096);
+        });
     }
 }
