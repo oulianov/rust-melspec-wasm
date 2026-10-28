@@ -45,15 +45,38 @@ thread_local! {
 pub struct MelSpectrogramAnalyzer {
     win_length: usize,
     window: Vec<f32>,
+    // Each mel triangle covers one contiguous run of FFT bins, starting at
+    // `mel_starts[mel]`, with its weights at
+    // `mel_weights[mel_offsets[mel]..mel_offsets[mel + 1]]`. Summing a run is
+    // a dot product, which vectorises; scattering bins into bands does not.
+    mel_starts: Vec<usize>,
     mel_offsets: Vec<usize>,
-    mel_indices: Vec<usize>,
     mel_weights: Vec<f32>,
     n_mels: usize,
     fft: Arc<dyn RealToComplex<f32>>,
     fft_input: Vec<f32>,
     fft_output: Vec<Complex32>,
     fft_scratch: Vec<Complex32>,
-    mel_frame: Vec<f32>,
+    magnitudes: Vec<f32>,
+}
+
+/// `weights · values` over four independent sums, so the loop vectorises.
+fn dot(weights: &[f32], values: &[f32]) -> f32 {
+    let mut sums = [0.0f32; 4];
+    let weight_chunks = weights.chunks_exact(4);
+    let value_chunks = values.chunks_exact(4);
+    let tail: f32 = weight_chunks
+        .remainder()
+        .iter()
+        .zip(value_chunks.remainder())
+        .map(|(weight, value)| weight * value)
+        .sum();
+    for (weight, value) in weight_chunks.zip(value_chunks) {
+        for lane in 0..4 {
+            sums[lane] += weight[lane] * value[lane];
+        }
+    }
+    (sums[0] + sums[1]) + (sums[2] + sums[3]) + tail
 }
 
 #[wasm_bindgen]
@@ -83,24 +106,29 @@ impl MelSpectrogramAnalyzer {
             .windows(2)
             .map(|points| points[1] - points[0])
             .collect();
-        let mut mel_offsets = Vec::with_capacity(n_freqs + 1);
-        let mut mel_indices = Vec::with_capacity(n_freqs * 2);
+        let mut mel_starts = Vec::with_capacity(n_mels);
+        let mut mel_offsets = Vec::with_capacity(n_mels + 1);
         let mut mel_weights = Vec::with_capacity(n_freqs * 2);
-        for frequency_index in 0..n_freqs {
-            mel_offsets.push(mel_indices.len());
-            let frequency = f_nyquist * frequency_index as f32 / (n_freqs - 1) as f32;
-            for mel_index in 0..n_mels {
+        for mel_index in 0..n_mels {
+            mel_offsets.push(mel_weights.len());
+            let mut start = None;
+            for frequency_index in 0..n_freqs {
+                let frequency = f_nyquist * frequency_index as f32 / (n_freqs - 1) as f32;
                 let down_slope = (frequency - f_points[mel_index]) / f_diff[mel_index];
                 let up_slope = (f_points[mel_index + 2] - frequency) / f_diff[mel_index + 1];
                 let weight = down_slope.min(up_slope).max(0.0)
                     * (2.0 / (f_points[mel_index + 2] - f_points[mel_index]));
                 if weight > 0.0 {
-                    mel_indices.push(mel_index);
+                    start.get_or_insert(frequency_index);
                     mel_weights.push(weight);
+                } else if start.is_some() {
+                    // A triangle is positive on one interval only.
+                    break;
                 }
             }
+            mel_starts.push(start.unwrap_or(0));
         }
-        mel_offsets.push(mel_indices.len());
+        mel_offsets.push(mel_weights.len());
 
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(n_fft);
@@ -111,15 +139,15 @@ impl MelSpectrogramAnalyzer {
         Self {
             win_length,
             window: hann_window(win_length),
+            mel_starts,
             mel_offsets,
-            mel_indices,
             mel_weights,
             n_mels,
             fft,
             fft_input,
             fft_output,
             fft_scratch,
-            mel_frame: vec![0.0; n_mels],
+            magnitudes: vec![0.0; n_freqs],
         }
     }
 
@@ -136,14 +164,32 @@ impl MelSpectrogramAnalyzer {
         let mut result = Vec::with_capacity(frame_count * self.n_mels);
 
         for frame_start in (0..frame_end).step_by(hop_length) {
-            self.fft_input.fill(0.0);
-            for window_index in 0..self.win_length {
-                let padded_index = frame_start + window_index;
-                if padded_index >= pad_size && padded_index < pad_size + waveform.len() {
-                    self.fft_input[window_index] =
-                        waveform[padded_index - pad_size] * self.window[window_index];
+            // The FFT uses its input as scratch, so every sample is rewritten.
+            let (windowed, zero_padding) = self.fft_input.split_at_mut(self.win_length);
+            match frame_start.checked_sub(pad_size) {
+                Some(first) if first + self.win_length <= waveform.len() => {
+                    let samples = &waveform[first..first + self.win_length];
+                    for ((output, sample), weight) in
+                        windowed.iter_mut().zip(samples).zip(&self.window)
+                    {
+                        *output = sample * weight;
+                    }
+                }
+                _ => {
+                    // Frames overlapping the padding read zeros outside the waveform.
+                    for (window_index, output) in windowed.iter_mut().enumerate() {
+                        let padded_index = frame_start + window_index;
+                        *output = if padded_index >= pad_size
+                            && padded_index < pad_size + waveform.len()
+                        {
+                            waveform[padded_index - pad_size] * self.window[window_index]
+                        } else {
+                            0.0
+                        };
+                    }
                 }
             }
+            zero_padding.fill(0.0);
             self.fft
                 .process_with_scratch(
                     &mut self.fft_input,
@@ -152,17 +198,15 @@ impl MelSpectrogramAnalyzer {
                 )
                 .expect("reusable real FFT buffers have inconsistent lengths");
 
-            self.mel_frame.fill(0.0);
-            for (frequency_index, value) in self.fft_output.iter().enumerate() {
-                let magnitude = value.norm();
-                for contribution_index in
-                    self.mel_offsets[frequency_index]..self.mel_offsets[frequency_index + 1]
-                {
-                    self.mel_frame[self.mel_indices[contribution_index]] +=
-                        magnitude * self.mel_weights[contribution_index];
-                }
+            for (magnitude, value) in self.magnitudes.iter_mut().zip(&self.fft_output) {
+                *magnitude = (value.re * value.re + value.im * value.im).sqrt();
             }
-            result.extend_from_slice(&self.mel_frame);
+            for mel_index in 0..self.n_mels {
+                let weights =
+                    &self.mel_weights[self.mel_offsets[mel_index]..self.mel_offsets[mel_index + 1]];
+                let start = self.mel_starts[mel_index];
+                result.push(dot(weights, &self.magnitudes[start..start + weights.len()]));
+            }
         }
 
         let mut max_db = f32::NEG_INFINITY;
@@ -515,6 +559,7 @@ mod tests {
 
     fn assert_optimized_matches_legacy(
         n_fft: usize,
+        win_length: usize,
         hop_length: usize,
         n_mels: usize,
         waveform: Vec<f32>,
@@ -525,7 +570,7 @@ mod tests {
                 sample_rate,
                 waveform.clone(),
                 n_fft,
-                n_fft,
+                win_length,
                 hop_length,
                 20.0,
                 24_000.0,
@@ -537,13 +582,13 @@ mod tests {
         .flatten()
         .collect();
         let mut analyzer =
-            MelSpectrogramAnalyzer::new(sample_rate, n_fft, n_fft, 20.0, 24_000.0, n_mels);
+            MelSpectrogramAnalyzer::new(sample_rate, n_fft, win_length, 20.0, 24_000.0, n_mels);
         let optimized = analyzer.compute_db(&waveform, hop_length, 90.0);
         let cached = compute_cached(
             sample_rate,
             &waveform,
             n_fft,
-            n_fft,
+            win_length,
             hop_length,
             20.0,
             24_000.0,
@@ -610,6 +655,7 @@ mod tests {
         for hop_length in [64, 512, 2048] {
             assert_optimized_matches_legacy(
                 2048,
+                2048,
                 hop_length,
                 256,
                 test_waveform(2048 * 4, 48_000.0),
@@ -622,9 +668,24 @@ mod tests {
         for hop_length in [128, 1024, 4096] {
             assert_optimized_matches_legacy(
                 4096,
+                4096,
                 hop_length,
                 512,
                 test_waveform(4096 * 3, 48_000.0),
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_analyzer_matches_legacy_with_zero_padding() {
+        // Neural Analog's displays pad each window to four times its length.
+        for hop_length in [512, 2048] {
+            assert_optimized_matches_legacy(
+                8192,
+                2048,
+                hop_length,
+                256,
+                test_waveform(2048 * 6, 48_000.0),
             );
         }
     }
